@@ -90,7 +90,19 @@ async def main():
 asyncio.run(main())
 ```
 
-## Credits
+## Authors
 
-Inspired by BloodBoy21's work:
+- BloodBoy21 (original implementation, https://github.com/BloodBoy21)
+- hucruz (upstream contributions, https://github.com/hucruz)
+
+## Maintainer
+
+- hucruz (https://github.com/hucruz)
+
+## Attribution
+
+Source repository:
 https://github.com/BloodBoy21/nerds-adk-python/tree/feat-redis-session
+
+This repository packages and adapts the upstream implementation for
+standalone use.

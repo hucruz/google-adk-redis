@@ -1,4 +1,5 @@
-# Copyright 2025 The project authors
+# Copyright 2025 BloodBoy21
+# Copyright 2025 hucruz
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Credits:
-# - BloodBoy21, https://github.com/BloodBoy21/nerds-adk-python/tree/feat-redis-session
+# Attribution:
+# - Original implementation by BloodBoy21, with contributions by hucruz:
+#   https://github.com/BloodBoy21/nerds-adk-python/tree/feat-redis-session
 from __future__ import annotations
 
 import base64
