@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-adk-redis"
+version = "0.1.0"
+description = "Redis-backed session service for Google ADK"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+  "google-adk>=1.10.0",
+  "redis>=6.0.0",
+  "typing-extensions>=4.5,<5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
