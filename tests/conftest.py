@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import sys
 from pathlib import Path
 
@@ -48,6 +49,19 @@ class MockRedis:
 
   async def hgetall(self, key: str) -> dict[bytes, bytes]:
     return dict(self._hashes.get(key, {}))
+
+  async def keys(self, pattern: str) -> list[bytes]:
+    return [
+        key.encode()
+        for key in self._kv.keys()
+        if fnmatch.fnmatch(key, pattern)
+    ]
+
+  async def scan_iter(self, match: str | None = None):
+    pattern = match or "*"
+    for key in list(self._kv.keys()):
+      if fnmatch.fnmatch(key, pattern):
+        yield key.encode()
 
 
 @pytest.fixture

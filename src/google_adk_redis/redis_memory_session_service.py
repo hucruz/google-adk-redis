@@ -33,7 +33,9 @@ import uuid
 import redis.asyncio as redis
 from typing_extensions import override
 
+from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.events.event import Event
+from google.adk.sessions import _session_util
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.base_session_service import ListSessionsResponse
@@ -170,6 +172,28 @@ class RedisMemorySessionService(BaseSessionService):
       state: Optional[dict[str, Any]] = None,
       session_id: Optional[str] = None,
   ) -> Session:
+    if session_id and await self._get_session_impl(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+    ):
+      raise AlreadyExistsError(f"Session with id {session_id} already exists.")
+
+    state_deltas = _session_util.extract_state_delta(state or {})
+    app_state_delta = state_deltas["app"]
+    user_state_delta = state_deltas["user"]
+    session_state = state_deltas["session"]
+    if app_state_delta:
+      await self._update_hash_state(
+          key=f"{State.APP_PREFIX}{app_name}",
+          state_delta=app_state_delta,
+      )
+    if user_state_delta:
+      await self._update_hash_state(
+          key=f"{State.USER_PREFIX}{app_name}:{user_id}",
+          state_delta=user_state_delta,
+      )
+
     session_id = (
         session_id.strip()
         if session_id and session_id.strip()
@@ -179,7 +203,7 @@ class RedisMemorySessionService(BaseSessionService):
         app_name=app_name,
         user_id=user_id,
         id=session_id,
-        state=state or {},
+        state=session_state or {},
         last_update_time=time.time(),
     )
 
@@ -259,12 +283,12 @@ class RedisMemorySessionService(BaseSessionService):
 
   @override
   async def list_sessions(
-      self, *, app_name: str, user_id: str
+      self, *, app_name: str, user_id: Optional[str] = None
   ) -> ListSessionsResponse:
     return await self._list_sessions_impl(app_name=app_name, user_id=user_id)
 
   def list_sessions_sync(
-      self, *, app_name: str, user_id: str
+      self, *, app_name: str, user_id: Optional[str] = None
   ) -> ListSessionsResponse:
     logger.warning("Deprecated. Please migrate to the async method.")
     import asyncio
@@ -274,17 +298,35 @@ class RedisMemorySessionService(BaseSessionService):
     )
 
   async def _list_sessions_impl(
-      self, *, app_name: str, user_id: str
+      self, *, app_name: str, user_id: Optional[str] = None
   ) -> ListSessionsResponse:
-    sessions = await self._load_sessions(app_name, user_id)
     sessions_without_events = []
 
-    for session_data in sessions.values():
-      session = _session_from_dict(session_data)
-      copied_session = copy.deepcopy(session)
-      copied_session.events = []
-      copied_session.state = {}
-      sessions_without_events.append(copied_session)
+    if user_id is None:
+      session_keys = await self._list_session_keys(app_name)
+      for session_key in session_keys:
+        session_user_id = self._user_id_from_session_key(app_name, session_key)
+        if not session_user_id:
+          continue
+        sessions = await self._load_sessions(app_name, session_user_id)
+        for session_data in sessions.values():
+          session = _session_from_dict(session_data)
+          copied_session = copy.deepcopy(session)
+          copied_session.events = []
+          copied_session = await self._merge_state(
+              app_name, copied_session.user_id, copied_session
+          )
+          sessions_without_events.append(copied_session)
+    else:
+      sessions = await self._load_sessions(app_name, user_id)
+      for session_data in sessions.values():
+        session = _session_from_dict(session_data)
+        copied_session = copy.deepcopy(session)
+        copied_session.events = []
+        copied_session = await self._merge_state(
+            app_name, user_id, copied_session
+        )
+        sessions_without_events.append(copied_session)
 
     return ListSessionsResponse(sessions=sessions_without_events)
 
@@ -326,26 +368,49 @@ class RedisMemorySessionService(BaseSessionService):
 
   @override
   async def append_event(self, session: Session, event: Event) -> Event:
+    if event.partial:
+      return event
+
+    sessions = await self._load_sessions(session.app_name, session.user_id)
+
+    def _warning(message: str) -> None:
+      logger.warning(
+          "Failed to append event to session %s: %s", session.id, message
+      )
+
+    if session.id not in sessions:
+      _warning("session_id not in sessions storage")
+      return event
+
     await super().append_event(session=session, event=event)
     session.last_update_time = event.timestamp
 
     if event.actions and event.actions.state_delta:
-      for key, value in event.actions.state_delta.items():
-        if key.startswith(State.APP_PREFIX):
-          await self.cache.hset(
-              f"{State.APP_PREFIX}{session.app_name}",
-              key.removeprefix(State.APP_PREFIX),
-              json.dumps(value),
-          )
-        if key.startswith(State.USER_PREFIX):
-          await self.cache.hset(
-              f"{State.USER_PREFIX}{session.app_name}:{session.user_id}",
-              key.removeprefix(State.USER_PREFIX),
-              json.dumps(value),
-          )
+      state_deltas = _session_util.extract_state_delta(
+          event.actions.state_delta
+      )
+      app_state_delta = state_deltas["app"]
+      user_state_delta = state_deltas["user"]
+      session_state_delta = state_deltas["session"]
+      if app_state_delta:
+        await self._update_hash_state(
+            key=f"{State.APP_PREFIX}{session.app_name}",
+            state_delta=app_state_delta,
+        )
+      if user_state_delta:
+        await self._update_hash_state(
+            key=f"{State.USER_PREFIX}{session.app_name}:{session.user_id}",
+            state_delta=user_state_delta,
+        )
 
-    sessions = await self._load_sessions(session.app_name, session.user_id)
-    sessions[session.id] = _session_to_dict(session)
+    storage_session = _session_from_dict(sessions[session.id])
+    storage_session.events.append(event)
+    storage_session.last_update_time = event.timestamp
+    if event.actions and event.actions.state_delta:
+      if session_state_delta:
+        storage_session.state.update(session_state_delta)
+
+    sessions[session.id] = _session_to_dict(storage_session)
     await self._save_sessions(session.app_name, session.user_id, sessions)
 
     return event
@@ -380,3 +445,39 @@ class RedisMemorySessionService(BaseSessionService):
     key = f"{State.APP_PREFIX}{app_name}:{user_id}"
     await self.cache.set(key, json.dumps(sessions, default=_json_serializer))
     await self.cache.expire(key, self.expire)
+
+  async def _update_hash_state(
+      self, *, key: str, state_delta: dict[str, Any]
+  ) -> None:
+    for state_key, value in state_delta.items():
+      await self.cache.hset(
+          key,
+          state_key,
+          json.dumps(value, default=_json_serializer),
+      )
+
+  async def _list_session_keys(self, app_name: str) -> list[str]:
+    prefix = f"{State.APP_PREFIX}{app_name}:"
+    pattern = f"{prefix}*"
+    keys: list[str] = []
+    if hasattr(self.cache, "scan_iter"):
+      async for key in self.cache.scan_iter(match=pattern):
+        key_str = key.decode() if isinstance(key, bytes) else key
+        if key_str.startswith(prefix):
+          keys.append(key_str)
+      return keys
+    if hasattr(self.cache, "keys"):
+      raw_keys = await self.cache.keys(pattern)
+      for key in raw_keys:
+        key_str = key.decode() if isinstance(key, bytes) else key
+        if key_str.startswith(prefix):
+          keys.append(key_str)
+    return keys
+
+  def _user_id_from_session_key(
+      self, app_name: str, key: str
+  ) -> Optional[str]:
+    prefix = f"{State.APP_PREFIX}{app_name}:"
+    if not key.startswith(prefix):
+      return None
+    return key[len(prefix) :]
