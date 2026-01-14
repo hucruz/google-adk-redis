@@ -83,6 +83,26 @@ def _restore_bytes(obj):
   return obj
 
 
+def _session_to_dict(session: Session) -> dict[str, Any]:
+  if hasattr(session, "to_dict"):
+    return session.to_dict()
+  if hasattr(session, "model_dump"):
+    return session.model_dump(
+        mode="json",
+        by_alias=False,
+        exclude_none=True,
+    )
+  return session.dict(by_alias=False, exclude_none=True)
+
+
+def _session_from_dict(data: dict[str, Any]) -> Session:
+  if hasattr(Session, "from_dict"):
+    return Session.from_dict(data)
+  if hasattr(Session, "model_validate"):
+    return Session.model_validate(data)
+  return Session.parse_obj(data)
+
+
 class RedisMemorySessionService(BaseSessionService):
   """A Redis-backed implementation of the session service."""
 
@@ -164,7 +184,7 @@ class RedisMemorySessionService(BaseSessionService):
     )
 
     sessions = await self._load_sessions(app_name, user_id)
-    sessions[session_id] = session.to_dict()
+    sessions[session_id] = _session_to_dict(session)
     await self._save_sessions(app_name, user_id, sessions)
 
     copied_session = copy.deepcopy(session)
@@ -218,7 +238,7 @@ class RedisMemorySessionService(BaseSessionService):
     if session_id not in sessions:
       return None
 
-    session = Session.from_dict(sessions[session_id])
+    session = _session_from_dict(sessions[session_id])
     copied_session = copy.deepcopy(session)
 
     if config:
@@ -260,7 +280,7 @@ class RedisMemorySessionService(BaseSessionService):
     sessions_without_events = []
 
     for session_data in sessions.values():
-      session = Session.from_dict(session_data)
+      session = _session_from_dict(session_data)
       copied_session = copy.deepcopy(session)
       copied_session.events = []
       copied_session.state = {}
@@ -325,7 +345,7 @@ class RedisMemorySessionService(BaseSessionService):
           )
 
     sessions = await self._load_sessions(session.app_name, session.user_id)
-    sessions[session.id] = session.to_dict()
+    sessions[session.id] = _session_to_dict(session)
     await self._save_sessions(session.app_name, session.user_id, sessions)
 
     return event

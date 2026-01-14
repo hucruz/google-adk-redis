@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "google-adk-redis"
-version = "0.1.0"
+version = "0.1.1"
 description = "Redis-backed session service for Google ADK"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,16 @@ dependencies = [
   "redis>=6.0.0",
   "typing-extensions>=4.5,<5",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
