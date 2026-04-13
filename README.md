@@ -10,7 +10,7 @@ From a Git repo:
 pip install git+https://github.com/hucruz/google-adk-redis.git
 ```
 
-From PyPI (once published):
+From PyPI:
 
 ```bash
 pip install google-adk-redis
@@ -28,6 +28,15 @@ session_service = RedisMemorySessionService(
     expire=60 * 60,
 )
 ```
+
+Instances created with the same Redis configuration reuse the same underlying
+async Redis client by default, so creating many services does not multiply
+connection pools. You can opt out with `share_cache=False` or inject a custom
+client with `cache=...`.
+
+If your application may attempt to load and create the same known session ID
+concurrently, prefer `get_or_create_session(...)` over a manual
+`get_session(...)` then `create_session(...)` sequence.
 
 ### Optional register for `google.adk.sessions`
 

@@ -25,12 +25,15 @@ from decimal import Decimal
 import json
 import logging
 import math
+from threading import Lock
 import time
 from typing import Any
+from typing import ClassVar
 from typing import Optional
 import uuid
 
 import redis.asyncio as redis
+from redis.exceptions import WatchError
 from typing_extensions import override
 
 from google.adk.errors.already_exists_error import AlreadyExistsError
@@ -45,6 +48,7 @@ from google.adk.sessions.state import State
 logger = logging.getLogger("google_adk_redis." + __name__)
 
 DEFAULT_EXPIRATION = 60 * 60  # 1 hour
+MAX_TRANSACTION_RETRIES = 8
 
 
 def _json_serializer(obj):
@@ -108,6 +112,9 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
 class RedisMemorySessionService(BaseSessionService):
   """A Redis-backed implementation of the session service."""
 
+  _shared_caches: ClassVar[dict[tuple[str, ...], redis.Redis]] = {}
+  _shared_caches_lock: ClassVar[Lock] = Lock()
+
   def __init__(
       self,
       host="localhost",
@@ -115,6 +122,8 @@ class RedisMemorySessionService(BaseSessionService):
       db=0,
       uri=None,
       expire=DEFAULT_EXPIRATION,
+      cache: Optional[Any] = None,
+      share_cache: bool = True,
   ):
     self.host = host
     self.port = port
@@ -122,11 +131,75 @@ class RedisMemorySessionService(BaseSessionService):
     self.uri = uri
     self.expire = expire
 
-    self.cache = (
+    if cache is not None:
+      self.cache = cache
+    elif share_cache:
+      self.cache = self._shared_cache(
+          host=host,
+          port=port,
+          db=db,
+          uri=uri,
+      )
+    else:
+      self.cache = self._create_cache(
+          host=host,
+          port=port,
+          db=db,
+          uri=uri,
+      )
+
+  @classmethod
+  def _shared_cache(
+      cls,
+      *,
+      host: str,
+      port: int,
+      db: int,
+      uri: Optional[str],
+  ) -> redis.Redis:
+    cache_key = cls._cache_key(
+        host=host,
+        port=port,
+        db=db,
+        uri=uri,
+    )
+    with cls._shared_caches_lock:
+      cache = cls._shared_caches.get(cache_key)
+      if cache is None:
+        cache = cls._create_cache(
+            host=host,
+            port=port,
+            db=db,
+            uri=uri,
+        )
+        cls._shared_caches[cache_key] = cache
+      return cache
+
+  @staticmethod
+  def _create_cache(
+      *,
+      host: str,
+      port: int,
+      db: int,
+      uri: Optional[str],
+  ) -> redis.Redis:
+    return (
         redis.Redis.from_url(uri)
         if uri
         else redis.Redis(host=host, port=port, db=db)
     )
+
+  @staticmethod
+  def _cache_key(
+      *,
+      host: str,
+      port: int,
+      db: int,
+      uri: Optional[str],
+  ) -> tuple[str, ...]:
+    if uri:
+      return ("uri", uri)
+    return ("tcp", str(host), str(port), str(db))
 
   @override
   async def create_session(
@@ -172,33 +245,12 @@ class RedisMemorySessionService(BaseSessionService):
       state: Optional[dict[str, Any]] = None,
       session_id: Optional[str] = None,
   ) -> Session:
-    if session_id and await self._get_session_impl(
-        app_name=app_name,
-        user_id=user_id,
-        session_id=session_id,
-    ):
-      raise AlreadyExistsError(f"Session with id {session_id} already exists.")
+    session_id = self._normalize_session_id(session_id)
 
     state_deltas = _session_util.extract_state_delta(state or {})
     app_state_delta = state_deltas["app"]
     user_state_delta = state_deltas["user"]
     session_state = state_deltas["session"]
-    if app_state_delta:
-      await self._update_hash_state(
-          key=f"{State.APP_PREFIX}{app_name}",
-          state_delta=app_state_delta,
-      )
-    if user_state_delta:
-      await self._update_hash_state(
-          key=f"{State.USER_PREFIX}{app_name}:{user_id}",
-          state_delta=user_state_delta,
-      )
-
-    session_id = (
-        session_id.strip()
-        if session_id and session_id.strip()
-        else str(uuid.uuid4())
-    )
     session = Session(
         app_name=app_name,
         user_id=user_id,
@@ -207,12 +259,88 @@ class RedisMemorySessionService(BaseSessionService):
         last_update_time=time.time(),
     )
 
-    sessions = await self._load_sessions(app_name, user_id)
-    sessions[session_id] = _session_to_dict(session)
-    await self._save_sessions(app_name, user_id, sessions)
+    created = await self._create_session_in_storage(
+        app_name=app_name,
+        user_id=user_id,
+        session=session,
+        app_state_delta=app_state_delta,
+        user_state_delta=user_state_delta,
+    )
+    if not created:
+      raise AlreadyExistsError(f"Session with id {session_id} already exists.")
 
     copied_session = copy.deepcopy(session)
     return await self._merge_state(app_name, user_id, copied_session)
+
+  async def get_or_create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+  ) -> Session:
+    return await self._get_or_create_session_impl(
+        app_name=app_name,
+        user_id=user_id,
+        state=state,
+        session_id=session_id,
+    )
+
+  def get_or_create_session_sync(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+  ) -> Session:
+    logger.warning("Deprecated. Please migrate to the async method.")
+    import asyncio
+
+    return asyncio.run(
+        self._get_or_create_session_impl(
+            app_name=app_name,
+            user_id=user_id,
+            state=state,
+            session_id=session_id,
+        )
+    )
+
+  async def _get_or_create_session_impl(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+  ) -> Session:
+    normalized_session_id = self._normalize_session_id(session_id)
+
+    loaded = await self._get_session_impl(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=normalized_session_id,
+    )
+    if loaded is not None:
+      return loaded
+
+    try:
+      return await self._create_session_impl(
+          app_name=app_name,
+          user_id=user_id,
+          state=state,
+          session_id=normalized_session_id,
+      )
+    except AlreadyExistsError:
+      loaded = await self._get_session_impl(
+          app_name=app_name,
+          user_id=user_id,
+          session_id=normalized_session_id,
+      )
+      if loaded is not None:
+        return loaded
+      raise
 
   @override
   async def get_session(
@@ -442,9 +570,59 @@ class RedisMemorySessionService(BaseSessionService):
   async def _save_sessions(
       self, app_name: str, user_id: str, sessions: dict[str, Any]
   ):
-    key = f"{State.APP_PREFIX}{app_name}:{user_id}"
+    key = self._sessions_key(app_name, user_id)
     await self.cache.set(key, json.dumps(sessions, default=_json_serializer))
     await self.cache.expire(key, self.expire)
+
+  async def _create_session_in_storage(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session: Session,
+      app_state_delta: dict[str, Any],
+      user_state_delta: dict[str, Any],
+  ) -> bool:
+    sessions_key = self._sessions_key(app_name, user_id)
+
+    for _ in range(MAX_TRANSACTION_RETRIES):
+      try:
+        async with self.cache.pipeline(transaction=True) as pipe:
+          await pipe.watch(sessions_key)
+          raw = await pipe.get(sessions_key)
+          sessions = self._decode_sessions(raw)
+          if session.id in sessions:
+            return False
+
+          sessions[session.id] = _session_to_dict(session)
+
+          pipe.multi()
+          if app_state_delta:
+            self._queue_hash_state_updates(
+                pipe,
+                key=f"{State.APP_PREFIX}{app_name}",
+                state_delta=app_state_delta,
+            )
+          if user_state_delta:
+            self._queue_hash_state_updates(
+                pipe,
+                key=f"{State.USER_PREFIX}{app_name}:{user_id}",
+                state_delta=user_state_delta,
+            )
+          pipe.set(
+              sessions_key,
+              json.dumps(sessions, default=_json_serializer),
+          )
+          pipe.expire(sessions_key, self.expire)
+          await pipe.execute()
+          return True
+      except WatchError:
+        continue
+
+    raise RuntimeError(
+        "Failed to create session due to concurrent writes. "
+        f"app_name={app_name}, user_id={user_id}, session_id={session.id}"
+    )
 
   async def _update_hash_state(
       self, *, key: str, state_delta: dict[str, Any]
@@ -455,6 +633,31 @@ class RedisMemorySessionService(BaseSessionService):
           state_key,
           json.dumps(value, default=_json_serializer),
       )
+
+  def _queue_hash_state_updates(
+      self, pipe: Any, *, key: str, state_delta: dict[str, Any]
+  ) -> None:
+    for state_key, value in state_delta.items():
+      pipe.hset(
+          key,
+          state_key,
+          json.dumps(value, default=_json_serializer),
+      )
+
+  def _normalize_session_id(self, session_id: Optional[str]) -> str:
+    return (
+        session_id.strip()
+        if session_id and session_id.strip()
+        else str(uuid.uuid4())
+    )
+
+  def _decode_sessions(self, raw: bytes | None) -> dict[str, dict[str, Any]]:
+    if not raw:
+      return {}
+    return json.loads(raw.decode())
+
+  def _sessions_key(self, app_name: str, user_id: str) -> str:
+    return f"{State.APP_PREFIX}{app_name}:{user_id}"
 
   async def _list_session_keys(self, app_name: str) -> list[str]:
     prefix = f"{State.APP_PREFIX}{app_name}:"
