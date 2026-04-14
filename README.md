@@ -39,10 +39,12 @@ If your application may attempt to load and create the same known session ID
 concurrently, prefer `get_or_create_session(...)` over a manual
 `get_session(...)` then `create_session(...)` sequence.
 
-Writers for the same `app_name` and `user_id` are serialized within a single
-Python process to avoid clobbering the shared session blob. If you still expect
-cross-process contention, increase `max_transaction_retries` and, if needed,
-adjust `transaction_retry_base_delay` / `transaction_retry_max_delay`.
+Each session is stored in its own Redis key using the shape
+`session:<app_name>:<user_id>:<session_id>`, so different sessions for the same
+user no longer overwrite each other through a shared JSON blob. If you still
+expect concurrent writes to the same session across processes, increase
+`max_transaction_retries` and, if needed, adjust
+`transaction_retry_base_delay` / `transaction_retry_max_delay`.
 
 ### Optional register for `google.adk.sessions`
 

@@ -13,6 +13,7 @@ from google.adk.sessions.state import State
 
 from google_adk_redis.redis_memory_session_service import (
   RedisMemorySessionService,
+  SESSION_PREFIX,
 )
 
 
@@ -315,7 +316,23 @@ async def test_create_session_preserves_concurrent_sessions_for_same_user(
 
 
 @pytest.mark.asyncio
-async def test_create_session_serializes_same_user_writes_within_process(
+async def test_create_session_uses_a_per_session_storage_key(
+    session_service: RedisMemorySessionService,
+):
+  await session_service.create_session(
+      app_name="demo-app",
+      user_id="user-123",
+      session_id="session-1",
+  )
+
+  assert (
+      f"{SESSION_PREFIX}demo-app:user-123:session-1"
+      in session_service.cache._kv
+  )
+
+
+@pytest.mark.asyncio
+async def test_create_session_does_not_serialize_different_sessions_for_user(
     monkeypatch: pytest.MonkeyPatch,
     session_service: RedisMemorySessionService,
 ):
@@ -343,7 +360,7 @@ async def test_create_session_serializes_same_user_writes_within_process(
       ),
   )
 
-  assert tracker["max"] == 1
+  assert tracker["max"] > 1
 
 
 @pytest.mark.asyncio

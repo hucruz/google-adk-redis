@@ -111,6 +111,17 @@ class MockRedis:
     self._touch(key)
     return True
 
+  async def delete(self, *keys: str) -> int:
+    deleted = 0
+    for key in keys:
+      if key in self._kv:
+        del self._kv[key]
+        deleted += 1
+      if key in self._expirations:
+        del self._expirations[key]
+      self._touch(key)
+    return deleted
+
   async def hset(self, key: str, field: object, value: object) -> int:
     field_bytes = _to_bytes(field)
     value_bytes = _to_bytes(value)

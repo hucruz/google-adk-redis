@@ -50,6 +50,7 @@ from google.adk.sessions.state import State
 
 logger = logging.getLogger("google_adk_redis." + __name__)
 
+SESSION_PREFIX = "session:"
 DEFAULT_EXPIRATION = 60 * 60  # 1 hour
 MAX_TRANSACTION_RETRIES = 8
 DEFAULT_TRANSACTION_RETRY_BASE_DELAY = 0.01
@@ -278,9 +279,11 @@ class RedisMemorySessionService(BaseSessionService):
         state=session_state or {},
         last_update_time=time.time(),
     )
+    session_key = self._session_key(app_name, user_id, session_id)
 
-    async with self._session_write_lock(app_name, user_id):
+    async with self._session_write_lock(session_key):
       created = await self._create_session_in_storage(
+          session_key=session_key,
           app_name=app_name,
           user_id=user_id,
           session=session,
@@ -407,11 +410,14 @@ class RedisMemorySessionService(BaseSessionService):
       session_id: str,
       config: Optional[GetSessionConfig] = None,
   ) -> Optional[Session]:
-    sessions = await self._load_sessions(app_name, user_id)
-    if session_id not in sessions:
+    session = await self._load_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if session is None:
       return None
 
-    session = _session_from_dict(sessions[session_id])
     copied_session = copy.deepcopy(session)
 
     if config:
@@ -450,32 +456,17 @@ class RedisMemorySessionService(BaseSessionService):
       self, *, app_name: str, user_id: Optional[str] = None
   ) -> ListSessionsResponse:
     sessions_without_events = []
-
-    if user_id is None:
-      session_keys = await self._list_session_keys(app_name)
-      for session_key in session_keys:
-        session_user_id = self._user_id_from_session_key(app_name, session_key)
-        if not session_user_id:
-          continue
-        sessions = await self._load_sessions(app_name, session_user_id)
-        for session_data in sessions.values():
-          session = _session_from_dict(session_data)
-          copied_session = copy.deepcopy(session)
-          copied_session.events = []
-          copied_session = await self._merge_state(
-              app_name, copied_session.user_id, copied_session
-          )
-          sessions_without_events.append(copied_session)
-    else:
-      sessions = await self._load_sessions(app_name, user_id)
-      for session_data in sessions.values():
-        session = _session_from_dict(session_data)
-        copied_session = copy.deepcopy(session)
-        copied_session.events = []
-        copied_session = await self._merge_state(
-            app_name, user_id, copied_session
-        )
-        sessions_without_events.append(copied_session)
+    session_keys = await self._list_session_keys(app_name, user_id)
+    for session_key in session_keys:
+      session = await self._load_session_by_key(session_key)
+      if session is None:
+        continue
+      copied_session = copy.deepcopy(session)
+      copied_session.events = []
+      copied_session = await self._merge_state(
+          app_name, copied_session.user_id, copied_session
+      )
+      sessions_without_events.append(copied_session)
 
     return ListSessionsResponse(sessions=sessions_without_events)
 
@@ -502,61 +493,96 @@ class RedisMemorySessionService(BaseSessionService):
   async def _delete_session_impl(
       self, *, app_name: str, user_id: str, session_id: str
   ) -> None:
-    async with self._session_write_lock(app_name, user_id):
-      sessions = await self._load_sessions(app_name, user_id)
-      if session_id in sessions:
-        del sessions[session_id]
-        await self._save_sessions(app_name, user_id, sessions)
+    session_key = self._session_key(app_name, user_id, session_id)
+    async with self._session_write_lock(session_key):
+      await self.cache.delete(session_key)
 
   @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event
 
-    async with self._session_write_lock(session.app_name, session.user_id):
-      sessions = await self._load_sessions(session.app_name, session.user_id)
+    session_key = self._session_key(
+        session.app_name,
+        session.user_id,
+        session.id,
+    )
+    async with self._session_write_lock(session_key):
 
       def _warning(message: str) -> None:
         logger.warning(
             "Failed to append event to session %s: %s", session.id, message
         )
 
-      if session.id not in sessions:
-        _warning("session_id not in sessions storage")
-        return event
+      appended_to_session = False
+      app_state_delta: dict[str, Any] = {}
+      user_state_delta: dict[str, Any] = {}
+      session_state_delta: dict[str, Any] = {}
 
-      await super().append_event(session=session, event=event)
-      session.last_update_time = event.timestamp
+      for attempt in range(self.max_transaction_retries):
+        try:
+          async with self.cache.pipeline(transaction=True) as pipe:
+            await pipe.watch(session_key)
+            raw = await pipe.get(session_key)
+            if not raw:
+              _warning("session_id not in sessions storage")
+              return event
 
-      if event.actions and event.actions.state_delta:
-        state_deltas = _session_util.extract_state_delta(
-            event.actions.state_delta
-        )
-        app_state_delta = state_deltas["app"]
-        user_state_delta = state_deltas["user"]
-        session_state_delta = state_deltas["session"]
-        if app_state_delta:
-          await self._update_hash_state(
-              key=f"{State.APP_PREFIX}{session.app_name}",
-              state_delta=app_state_delta,
-          )
-        if user_state_delta:
-          await self._update_hash_state(
-              key=f"{State.USER_PREFIX}{session.app_name}:{session.user_id}",
-              state_delta=user_state_delta,
-          )
+            if not appended_to_session:
+              await super().append_event(session=session, event=event)
+              session.last_update_time = event.timestamp
+              if event.actions and event.actions.state_delta:
+                state_deltas = _session_util.extract_state_delta(
+                    event.actions.state_delta
+                )
+                app_state_delta = state_deltas["app"]
+                user_state_delta = state_deltas["user"]
+                session_state_delta = state_deltas["session"]
+              appended_to_session = True
 
-      storage_session = _session_from_dict(sessions[session.id])
-      storage_session.events.append(event)
-      storage_session.last_update_time = event.timestamp
-      if event.actions and event.actions.state_delta:
-        if session_state_delta:
-          storage_session.state.update(session_state_delta)
+            storage_session = _session_from_dict(self._decode_session(raw))
+            storage_session.events.append(event)
+            storage_session.last_update_time = event.timestamp
+            if session_state_delta:
+              storage_session.state.update(session_state_delta)
 
-      sessions[session.id] = _session_to_dict(storage_session)
-      await self._save_sessions(session.app_name, session.user_id, sessions)
+            pipe.multi()
+            if app_state_delta:
+              self._queue_hash_state_updates(
+                  pipe,
+                  key=f"{State.APP_PREFIX}{session.app_name}",
+                  state_delta=app_state_delta,
+              )
+            if user_state_delta:
+              self._queue_hash_state_updates(
+                  pipe,
+                  key=(
+                      f"{State.USER_PREFIX}{session.app_name}:"
+                      f"{session.user_id}"
+                  ),
+                  state_delta=user_state_delta,
+              )
+            pipe.set(
+                session_key,
+                json.dumps(
+                    _session_to_dict(storage_session),
+                    default=_json_serializer,
+                ),
+            )
+            pipe.expire(session_key, self.expire)
+            await pipe.execute()
+            return event
+        except WatchError:
+          delay = self._transaction_retry_delay(attempt)
+          if delay > 0:
+            await asyncio.sleep(delay)
+          continue
 
-    return event
+      raise RuntimeError(
+          "Failed to append event after retrying concurrent writes. "
+          f"app_name={session.app_name}, user_id={session.user_id}, "
+          f"session_id={session.id}, retries={self.max_transaction_retries}"
+      )
 
   async def _merge_state(
       self, app_name: str, user_id: str, session: Session
@@ -572,44 +598,41 @@ class RedisMemorySessionService(BaseSessionService):
 
     return session
 
-  async def _load_sessions(
-      self, app_name: str, user_id: str
-  ) -> dict[str, dict]:
-    key = f"{State.APP_PREFIX}{app_name}:{user_id}"
+  async def _load_session(
+      self, *, app_name: str, user_id: str, session_id: str
+  ) -> Optional[Session]:
+    return await self._load_session_by_key(
+        self._session_key(app_name, user_id, session_id)
+    )
+
+  async def _load_session_by_key(self, key: str) -> Optional[Session]:
     raw = await self.cache.get(key)
     if not raw:
-      return {}
-    raw_data = json.loads(raw.decode())
-    return raw_data
-
-  async def _save_sessions(
-      self, app_name: str, user_id: str, sessions: dict[str, Any]
-  ):
-    key = self._sessions_key(app_name, user_id)
-    await self.cache.set(key, json.dumps(sessions, default=_json_serializer))
-    await self.cache.expire(key, self.expire)
+      return None
+    return _session_from_dict(self._decode_session(raw))
 
   async def _create_session_in_storage(
       self,
       *,
+      session_key: str,
       app_name: str,
       user_id: str,
       session: Session,
       app_state_delta: dict[str, Any],
       user_state_delta: dict[str, Any],
   ) -> bool:
-    sessions_key = self._sessions_key(app_name, user_id)
+    session_payload = json.dumps(
+        _session_to_dict(session),
+        default=_json_serializer,
+    )
 
     for attempt in range(self.max_transaction_retries):
       try:
         async with self.cache.pipeline(transaction=True) as pipe:
-          await pipe.watch(sessions_key)
-          raw = await pipe.get(sessions_key)
-          sessions = self._decode_sessions(raw)
-          if session.id in sessions:
+          await pipe.watch(session_key)
+          raw = await pipe.get(session_key)
+          if raw is not None:
             return False
-
-          sessions[session.id] = _session_to_dict(session)
 
           pipe.multi()
           if app_state_delta:
@@ -624,11 +647,8 @@ class RedisMemorySessionService(BaseSessionService):
                 key=f"{State.USER_PREFIX}{app_name}:{user_id}",
                 state_delta=user_state_delta,
             )
-          pipe.set(
-              sessions_key,
-              json.dumps(sessions, default=_json_serializer),
-          )
-          pipe.expire(sessions_key, self.expire)
+          pipe.set(session_key, session_payload)
+          pipe.expire(session_key, self.expire)
           await pipe.execute()
           return True
       except WatchError:
@@ -637,8 +657,7 @@ class RedisMemorySessionService(BaseSessionService):
           await asyncio.sleep(delay)
         continue
 
-    sessions = await self._load_sessions(app_name, user_id)
-    if session.id in sessions:
+    if await self._load_session_by_key(session_key) is not None:
       return False
 
     raise RuntimeError(
@@ -646,16 +665,6 @@ class RedisMemorySessionService(BaseSessionService):
         f"app_name={app_name}, user_id={user_id}, session_id={session.id}, "
         f"retries={self.max_transaction_retries}"
     )
-
-  async def _update_hash_state(
-      self, *, key: str, state_delta: dict[str, Any]
-  ) -> None:
-    for state_key, value in state_delta.items():
-      await self.cache.hset(
-          key,
-          state_key,
-          json.dumps(value, default=_json_serializer),
-      )
 
   def _queue_hash_state_updates(
       self, pipe: Any, *, key: str, state_delta: dict[str, Any]
@@ -674,9 +683,9 @@ class RedisMemorySessionService(BaseSessionService):
         else str(uuid.uuid4())
     )
 
-  def _session_write_lock(self, app_name: str, user_id: str) -> asyncio.Lock:
+  def _session_write_lock(self, storage_key: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
-    lock_key = (id(self.cache), self._sessions_key(app_name, user_id))
+    lock_key = (id(self.cache), storage_key)
     with self._session_write_locks_lock:
       loop_locks = self._session_write_locks.setdefault(loop, {})
       lock = loop_locks.get(lock_key)
@@ -695,36 +704,32 @@ class RedisMemorySessionService(BaseSessionService):
     )
     return delay + random.uniform(0.0, self.transaction_retry_base_delay)
 
-  def _decode_sessions(self, raw: bytes | None) -> dict[str, dict[str, Any]]:
+  def _decode_session(self, raw: bytes | None) -> dict[str, Any]:
     if not raw:
       return {}
     return json.loads(raw.decode())
 
-  def _sessions_key(self, app_name: str, user_id: str) -> str:
-    return f"{State.APP_PREFIX}{app_name}:{user_id}"
+  def _session_key(self, app_name: str, user_id: str, session_id: str) -> str:
+    return f"{SESSION_PREFIX}{app_name}:{user_id}:{session_id}"
 
-  async def _list_session_keys(self, app_name: str) -> list[str]:
-    prefix = f"{State.APP_PREFIX}{app_name}:"
-    pattern = f"{prefix}*"
+  def _session_pattern(
+      self, app_name: str, user_id: Optional[str] = None
+  ) -> str:
+    if user_id is None:
+      return f"{SESSION_PREFIX}{app_name}:*"
+    return f"{SESSION_PREFIX}{app_name}:{user_id}:*"
+
+  async def _list_session_keys(
+      self, app_name: str, user_id: Optional[str] = None
+  ) -> list[str]:
+    pattern = self._session_pattern(app_name, user_id)
     keys: list[str] = []
     if hasattr(self.cache, "scan_iter"):
       async for key in self.cache.scan_iter(match=pattern):
-        key_str = key.decode() if isinstance(key, bytes) else key
-        if key_str.startswith(prefix):
-          keys.append(key_str)
+        keys.append(key.decode() if isinstance(key, bytes) else key)
       return keys
     if hasattr(self.cache, "keys"):
       raw_keys = await self.cache.keys(pattern)
       for key in raw_keys:
-        key_str = key.decode() if isinstance(key, bytes) else key
-        if key_str.startswith(prefix):
-          keys.append(key_str)
+        keys.append(key.decode() if isinstance(key, bytes) else key)
     return keys
-
-  def _user_id_from_session_key(
-      self, app_name: str, key: str
-  ) -> Optional[str]:
-    prefix = f"{State.APP_PREFIX}{app_name}:"
-    if not key.startswith(prefix):
-      return None
-    return key[len(prefix) :]
