@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from redis.exceptions import WatchError
 
 from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.events.event import Event
@@ -40,6 +41,51 @@ class _FakeRedisFactory:
     )
     self._created_clients.append(client)
     return client
+
+
+class _ConcurrentTrackingPipeline:
+  def __init__(self, wrapped, tracker: dict[str, int]) -> None:
+    self._wrapped = wrapped
+    self._tracker = tracker
+
+  async def __aenter__(self):
+    await self._wrapped.__aenter__()
+    self._tracker["current"] += 1
+    self._tracker["max"] = max(
+        self._tracker["max"],
+        self._tracker["current"],
+    )
+    await asyncio.sleep(0)
+    return self
+
+  async def __aexit__(self, exc_type, exc_value, traceback):
+    self._tracker["current"] -= 1
+    return await self._wrapped.__aexit__(exc_type, exc_value, traceback)
+
+  def __getattr__(self, name: str):
+    return getattr(self._wrapped, name)
+
+
+class _InjectedWatchErrorPipeline:
+  def __init__(self, wrapped, failures: dict[str, int]) -> None:
+    self._wrapped = wrapped
+    self._failures = failures
+
+  async def __aenter__(self):
+    await self._wrapped.__aenter__()
+    return self
+
+  async def __aexit__(self, exc_type, exc_value, traceback):
+    return await self._wrapped.__aexit__(exc_type, exc_value, traceback)
+
+  async def execute(self):
+    if self._failures["remaining"] > 0:
+      self._failures["remaining"] -= 1
+      raise WatchError("Injected watch error")
+    return await self._wrapped.execute()
+
+  def __getattr__(self, name: str):
+    return getattr(self._wrapped, name)
 
 
 @pytest.mark.parametrize(
@@ -266,6 +312,70 @@ async def test_create_session_preserves_concurrent_sessions_for_same_user(
       "session-1",
       "session-2",
   }
+
+
+@pytest.mark.asyncio
+async def test_create_session_serializes_same_user_writes_within_process(
+    monkeypatch: pytest.MonkeyPatch,
+    session_service: RedisMemorySessionService,
+):
+  tracker = {"current": 0, "max": 0}
+  original_pipeline = session_service.cache.pipeline
+
+  def tracked_pipeline(transaction: bool = True):
+    return _ConcurrentTrackingPipeline(
+        original_pipeline(transaction=transaction),
+        tracker,
+    )
+
+  monkeypatch.setattr(session_service.cache, "pipeline", tracked_pipeline)
+
+  await asyncio.gather(
+      session_service.create_session(
+          app_name="demo-app",
+          user_id="user-123",
+          session_id="session-1",
+      ),
+      session_service.create_session(
+          app_name="demo-app",
+          user_id="user-123",
+          session_id="session-2",
+      ),
+  )
+
+  assert tracker["max"] == 1
+
+
+@pytest.mark.asyncio
+async def test_create_session_honors_configured_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    session_service: RedisMemorySessionService,
+):
+  service = RedisMemorySessionService(
+      cache=session_service.cache,
+      max_transaction_retries=12,
+      transaction_retry_base_delay=0,
+      transaction_retry_max_delay=0,
+  )
+  failures = {"remaining": 10}
+  original_pipeline = service.cache.pipeline
+
+  def flaky_pipeline(transaction: bool = True):
+    return _InjectedWatchErrorPipeline(
+        original_pipeline(transaction=transaction),
+        failures,
+    )
+
+  monkeypatch.setattr(service.cache, "pipeline", flaky_pipeline)
+
+  session = await service.create_session(
+      app_name="demo-app",
+      user_id="user-123",
+      session_id="session-1",
+  )
+
+  assert session.id == "session-1"
+  assert failures["remaining"] == 0
 
 
 @pytest.mark.asyncio

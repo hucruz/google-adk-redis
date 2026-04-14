@@ -18,6 +18,7 @@
 #   https://github.com/BloodBoy21/nerds-adk-python/tree/feat-redis-session
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import datetime
@@ -25,12 +26,14 @@ from decimal import Decimal
 import json
 import logging
 import math
+import random
 from threading import Lock
 import time
 from typing import Any
 from typing import ClassVar
 from typing import Optional
 import uuid
+import weakref
 
 import redis.asyncio as redis
 from redis.exceptions import WatchError
@@ -49,6 +52,8 @@ logger = logging.getLogger("google_adk_redis." + __name__)
 
 DEFAULT_EXPIRATION = 60 * 60  # 1 hour
 MAX_TRANSACTION_RETRIES = 8
+DEFAULT_TRANSACTION_RETRY_BASE_DELAY = 0.01
+DEFAULT_TRANSACTION_RETRY_MAX_DELAY = 0.25
 
 
 def _json_serializer(obj):
@@ -114,6 +119,10 @@ class RedisMemorySessionService(BaseSessionService):
 
   _shared_caches: ClassVar[dict[tuple[str, ...], redis.Redis]] = {}
   _shared_caches_lock: ClassVar[Lock] = Lock()
+  _session_write_locks: ClassVar[
+      weakref.WeakKeyDictionary[Any, dict[tuple[int, str], asyncio.Lock]]
+  ] = weakref.WeakKeyDictionary()
+  _session_write_locks_lock: ClassVar[Lock] = Lock()
 
   def __init__(
       self,
@@ -122,6 +131,11 @@ class RedisMemorySessionService(BaseSessionService):
       db=0,
       uri=None,
       expire=DEFAULT_EXPIRATION,
+      max_transaction_retries: int = MAX_TRANSACTION_RETRIES,
+      transaction_retry_base_delay: float = (
+          DEFAULT_TRANSACTION_RETRY_BASE_DELAY
+      ),
+      transaction_retry_max_delay: float = DEFAULT_TRANSACTION_RETRY_MAX_DELAY,
       cache: Optional[Any] = None,
       share_cache: bool = True,
   ):
@@ -130,6 +144,12 @@ class RedisMemorySessionService(BaseSessionService):
     self.db = db
     self.uri = uri
     self.expire = expire
+    self.max_transaction_retries = max(1, max_transaction_retries)
+    self.transaction_retry_base_delay = max(0.0, transaction_retry_base_delay)
+    self.transaction_retry_max_delay = max(
+        self.transaction_retry_base_delay,
+        transaction_retry_max_delay,
+    )
 
     if cache is not None:
       self.cache = cache
@@ -259,13 +279,14 @@ class RedisMemorySessionService(BaseSessionService):
         last_update_time=time.time(),
     )
 
-    created = await self._create_session_in_storage(
-        app_name=app_name,
-        user_id=user_id,
-        session=session,
-        app_state_delta=app_state_delta,
-        user_state_delta=user_state_delta,
-    )
+    async with self._session_write_lock(app_name, user_id):
+      created = await self._create_session_in_storage(
+          app_name=app_name,
+          user_id=user_id,
+          session=session,
+          app_state_delta=app_state_delta,
+          user_state_delta=user_state_delta,
+      )
     if not created:
       raise AlreadyExistsError(f"Session with id {session_id} already exists.")
 
@@ -481,65 +502,59 @@ class RedisMemorySessionService(BaseSessionService):
   async def _delete_session_impl(
       self, *, app_name: str, user_id: str, session_id: str
   ) -> None:
-    if (
-        await self._get_session_impl(
-            app_name=app_name, user_id=user_id, session_id=session_id
-        )
-        is None
-    ):
-      return
-
-    sessions = await self._load_sessions(app_name, user_id)
-    if session_id in sessions:
-      del sessions[session_id]
-      await self._save_sessions(app_name, user_id, sessions)
+    async with self._session_write_lock(app_name, user_id):
+      sessions = await self._load_sessions(app_name, user_id)
+      if session_id in sessions:
+        del sessions[session_id]
+        await self._save_sessions(app_name, user_id, sessions)
 
   @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event
 
-    sessions = await self._load_sessions(session.app_name, session.user_id)
+    async with self._session_write_lock(session.app_name, session.user_id):
+      sessions = await self._load_sessions(session.app_name, session.user_id)
 
-    def _warning(message: str) -> None:
-      logger.warning(
-          "Failed to append event to session %s: %s", session.id, message
-      )
-
-    if session.id not in sessions:
-      _warning("session_id not in sessions storage")
-      return event
-
-    await super().append_event(session=session, event=event)
-    session.last_update_time = event.timestamp
-
-    if event.actions and event.actions.state_delta:
-      state_deltas = _session_util.extract_state_delta(
-          event.actions.state_delta
-      )
-      app_state_delta = state_deltas["app"]
-      user_state_delta = state_deltas["user"]
-      session_state_delta = state_deltas["session"]
-      if app_state_delta:
-        await self._update_hash_state(
-            key=f"{State.APP_PREFIX}{session.app_name}",
-            state_delta=app_state_delta,
-        )
-      if user_state_delta:
-        await self._update_hash_state(
-            key=f"{State.USER_PREFIX}{session.app_name}:{session.user_id}",
-            state_delta=user_state_delta,
+      def _warning(message: str) -> None:
+        logger.warning(
+            "Failed to append event to session %s: %s", session.id, message
         )
 
-    storage_session = _session_from_dict(sessions[session.id])
-    storage_session.events.append(event)
-    storage_session.last_update_time = event.timestamp
-    if event.actions and event.actions.state_delta:
-      if session_state_delta:
-        storage_session.state.update(session_state_delta)
+      if session.id not in sessions:
+        _warning("session_id not in sessions storage")
+        return event
 
-    sessions[session.id] = _session_to_dict(storage_session)
-    await self._save_sessions(session.app_name, session.user_id, sessions)
+      await super().append_event(session=session, event=event)
+      session.last_update_time = event.timestamp
+
+      if event.actions and event.actions.state_delta:
+        state_deltas = _session_util.extract_state_delta(
+            event.actions.state_delta
+        )
+        app_state_delta = state_deltas["app"]
+        user_state_delta = state_deltas["user"]
+        session_state_delta = state_deltas["session"]
+        if app_state_delta:
+          await self._update_hash_state(
+              key=f"{State.APP_PREFIX}{session.app_name}",
+              state_delta=app_state_delta,
+          )
+        if user_state_delta:
+          await self._update_hash_state(
+              key=f"{State.USER_PREFIX}{session.app_name}:{session.user_id}",
+              state_delta=user_state_delta,
+          )
+
+      storage_session = _session_from_dict(sessions[session.id])
+      storage_session.events.append(event)
+      storage_session.last_update_time = event.timestamp
+      if event.actions and event.actions.state_delta:
+        if session_state_delta:
+          storage_session.state.update(session_state_delta)
+
+      sessions[session.id] = _session_to_dict(storage_session)
+      await self._save_sessions(session.app_name, session.user_id, sessions)
 
     return event
 
@@ -585,7 +600,7 @@ class RedisMemorySessionService(BaseSessionService):
   ) -> bool:
     sessions_key = self._sessions_key(app_name, user_id)
 
-    for _ in range(MAX_TRANSACTION_RETRIES):
+    for attempt in range(self.max_transaction_retries):
       try:
         async with self.cache.pipeline(transaction=True) as pipe:
           await pipe.watch(sessions_key)
@@ -617,11 +632,19 @@ class RedisMemorySessionService(BaseSessionService):
           await pipe.execute()
           return True
       except WatchError:
+        delay = self._transaction_retry_delay(attempt)
+        if delay > 0:
+          await asyncio.sleep(delay)
         continue
 
+    sessions = await self._load_sessions(app_name, user_id)
+    if session.id in sessions:
+      return False
+
     raise RuntimeError(
-        "Failed to create session due to concurrent writes. "
-        f"app_name={app_name}, user_id={user_id}, session_id={session.id}"
+        "Failed to create session after retrying concurrent writes. "
+        f"app_name={app_name}, user_id={user_id}, session_id={session.id}, "
+        f"retries={self.max_transaction_retries}"
     )
 
   async def _update_hash_state(
@@ -650,6 +673,27 @@ class RedisMemorySessionService(BaseSessionService):
         if session_id and session_id.strip()
         else str(uuid.uuid4())
     )
+
+  def _session_write_lock(self, app_name: str, user_id: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock_key = (id(self.cache), self._sessions_key(app_name, user_id))
+    with self._session_write_locks_lock:
+      loop_locks = self._session_write_locks.setdefault(loop, {})
+      lock = loop_locks.get(lock_key)
+      if lock is None:
+        lock = asyncio.Lock()
+        loop_locks[lock_key] = lock
+      return lock
+
+  def _transaction_retry_delay(self, attempt: int) -> float:
+    if self.transaction_retry_base_delay <= 0:
+      return 0.0
+
+    delay = min(
+        self.transaction_retry_base_delay * (2**attempt),
+        self.transaction_retry_max_delay,
+    )
+    return delay + random.uniform(0.0, self.transaction_retry_base_delay)
 
   def _decode_sessions(self, raw: bytes | None) -> dict[str, dict[str, Any]]:
     if not raw:

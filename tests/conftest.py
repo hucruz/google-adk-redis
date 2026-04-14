@@ -151,5 +151,7 @@ def session_service() -> RedisMemorySessionService:
 @pytest.fixture(autouse=True)
 def clear_shared_caches():
   RedisMemorySessionService._shared_caches.clear()
+  RedisMemorySessionService._session_write_locks.clear()
   yield
   RedisMemorySessionService._shared_caches.clear()
+  RedisMemorySessionService._session_write_locks.clear()

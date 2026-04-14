@@ -26,6 +26,7 @@ session_service = RedisMemorySessionService(
     port=6379,
     db=0,
     expire=60 * 60,
+    max_transaction_retries=16,
 )
 ```
 
@@ -37,6 +38,11 @@ client with `cache=...`.
 If your application may attempt to load and create the same known session ID
 concurrently, prefer `get_or_create_session(...)` over a manual
 `get_session(...)` then `create_session(...)` sequence.
+
+Writers for the same `app_name` and `user_id` are serialized within a single
+Python process to avoid clobbering the shared session blob. If you still expect
+cross-process contention, increase `max_transaction_retries` and, if needed,
+adjust `transaction_retry_base_delay` / `transaction_retry_max_delay`.
 
 ### Optional register for `google.adk.sessions`
 
